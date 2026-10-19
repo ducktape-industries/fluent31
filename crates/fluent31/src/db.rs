@@ -2152,18 +2152,31 @@ fn flush_thread(db: Arc<DbInner>) {
     }
 }
 
+enum Maintained {
+    Worked,
+    Idle,
+    Stopped,
+}
+
+fn maintained(db: &Arc<DbInner>) -> Maintained {
+    match crate::compaction::maintenance_pass(db) {
+        Ok(true) => Maintained::Worked,
+        Ok(false) => Maintained::Idle,
+        Err(Error::Closed) => Maintained::Stopped,
+        Err(e) => {
+            db.set_bg_error(format!("compaction failed: {e}"));
+            db.progress_signal.notify();
+            Maintained::Idle
+        }
+    }
+}
+
 fn compact_thread(db: Arc<DbInner>) {
     while !db.shutdown.load(Ordering::Acquire) {
-        let did = match crate::compaction::maintenance_pass(&db) {
-            Ok(did) => did,
-            Err(e) => {
-                db.set_bg_error(format!("compaction failed: {e}"));
-                db.progress_signal.notify();
-                false
-            }
-        };
-        if !did {
-            db.compact_signal.wait_timeout(Duration::from_millis(250));
+        match maintained(&db) {
+            Maintained::Worked => {}
+            Maintained::Idle => db.compact_signal.wait_timeout(Duration::from_millis(250)),
+            Maintained::Stopped => return,
         }
     }
 }
@@ -3415,6 +3428,19 @@ mod dir_lock_tests {
         let reopened = crate::Db::open(dir.path(), Options::default());
         drop(inherited_fd);
         reopened.unwrap();
+    }
+
+    #[test]
+    fn a_maintenance_pass_cut_off_by_close_stops_without_degrading_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::Db::open(dir.path(), Options::default()).unwrap();
+        db.put("k", "v").unwrap();
+        db.inner.shutdown.store(true, Ordering::Release);
+        assert!(matches!(maintained(&db.inner), Maintained::Stopped));
+        assert_eq!(*db.inner.bg_error.lock(), None);
+        drop(db);
+        let reopened = crate::Db::open(dir.path(), Options::default()).unwrap();
+        assert_eq!(reopened.get(b"k").unwrap(), Some(b"v".to_vec()));
     }
 
     /// The lock still excludes a second open while the store is live.
