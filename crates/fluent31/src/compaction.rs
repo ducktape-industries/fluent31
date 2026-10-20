@@ -26,15 +26,15 @@ use std::time::Instant;
 use tracing::{debug, info};
 
 use crate::batch::BatchOp;
-use crate::db::{DbInner, RetiredVlog};
+use crate::db::{DbInner, Placed, RetiredVlog};
 use crate::error::Result;
 use crate::iter::{InternalIterator, MergeIterator};
 use crate::manifest::RunMeta;
 use crate::table::TableBuilder;
 use crate::types::{
-    decode_repr, ikey_kind, ikey_seqno, ikey_ukey, ReprRef, SeqNo, ValueKind, MAX_SEQNO,
+    decode_repr, ikey_kind, ikey_seqno, ikey_ukey, ReprRef, SeqNo, ValueKind, ValuePtr, MAX_SEQNO,
 };
-use crate::version::{Run, TableHandle};
+use crate::version::{ReadView, Run, TableHandle};
 use crate::vlog::{self, VlogFileHandle};
 
 pub(crate) struct Job {
@@ -751,7 +751,8 @@ const GC_SAMPLE_BYTES: u64 = 1 << 20;
 const GC_SAMPLE_MIN_FILE: u64 = 4 << 20;
 /// Don't resample a below-ratio file until this many new writes have
 /// happened — its dead ratio can only change with writes. A vlog head
-/// rotation also expires the cooldown: for large-value workloads a sealed
+/// rotation by a write (never by GC's own relocations) also expires the
+/// cooldown: for large-value workloads a sealed
 /// ~vlog_file_size of new data is massive garbage potential while the
 /// seqno counter barely moves (the maintenance loop samples files EARLY,
 /// while they are still mostly live — without the rotation escape those
@@ -769,8 +770,15 @@ const GC_RESAMPLE_SEQ_DELTA: u64 = 10_000;
 /// truth), while the old behavior — waiting for compaction to happen to
 /// observe the garbage — could defer reclaiming a mostly-dead file
 /// indefinitely under lazy leveling.
+fn written_marks(db: &DbInner) -> (SeqNo, u64) {
+    let relocated = db.relocated_seqnos.load(Ordering::Acquire);
+    let visible = db.visible_seqno.load(Ordering::Acquire);
+    let rotations = db.written_rotations.load(Ordering::Acquire);
+    (visible.saturating_sub(relocated), rotations)
+}
+
 fn sample_victim(db: &Arc<DbInner>) -> Result<Option<(u64, Arc<VlogFileHandle>)>> {
-    let visible = db.visible_seqno.load(std::sync::atomic::Ordering::Acquire);
+    let (written, rotations) = written_marks(db);
 
     // candidates: sealed, not retired, big enough, not on cooldown —
     // lowest id first (oldest data is the most likely to have died)
@@ -789,8 +797,9 @@ fn sample_victim(db: &Arc<DbInner>) -> Result<Option<(u64, Arc<VlogFileHandle>)>
             .filter(|id| {
                 sampled
                     .get(id)
-                    .map(|&(at_seq, at_head)| {
-                        visible.saturating_sub(at_seq) >= GC_RESAMPLE_SEQ_DELTA || at_head != head
+                    .map(|&(at_seq, at_rotations)| {
+                        written.saturating_sub(at_seq) >= GC_RESAMPLE_SEQ_DELTA
+                            || at_rotations != rotations
                     })
                     .unwrap_or(true)
             })
@@ -810,10 +819,9 @@ fn sample_victim(db: &Arc<DbInner>) -> Result<Option<(u64, Arc<VlogFileHandle>)>
         return Ok(None);
     };
 
-    let head_now = db.state.read().version.vlog_head_id;
     let (records, sampled_len) = vlog::sample_records(handle.file.as_ref(), GC_SAMPLE_BYTES)?;
     if sampled_len == 0 {
-        db.gc_sampled_at.lock().insert(id, (visible, head_now));
+        db.gc_sampled_at.lock().insert(id, (written, rotations));
         return Ok(None);
     }
     let view = db.read_view();
@@ -835,17 +843,46 @@ fn sample_victim(db: &Arc<DbInner>) -> Result<Option<(u64, Arc<VlogFileHandle>)>
     if ratio >= db.opts.vlog_gc_ratio {
         Ok(Some((id, handle)))
     } else {
-        db.gc_sampled_at.lock().insert(id, (visible, head_now));
+        db.gc_sampled_at.lock().insert(id, (written, rotations));
         Ok(None)
     }
 }
 
+/// The value pointer `key` resolves to in `view`, when it still names the
+/// record at `offset` of vlog file `file`.
+fn live_pointer(
+    view: &ReadView,
+    key: &[u8],
+    file: u64,
+    offset: u64,
+    len: u32,
+) -> Result<Option<ValuePtr>> {
+    let Some((ValueKind::Put, _, repr)) = view.get_versioned(key, MAX_SEQNO)? else {
+        return Ok(None);
+    };
+    let ReprRef::Ptr(p) = decode_repr(&repr)? else {
+        return Ok(None);
+    };
+    let here = p.file == file && p.offset == offset && p.len == len;
+    Ok(here.then_some(p))
+}
+
 /// One GC pass: pick the most-garbage sealed vlog file above the configured
-/// ratio, relocate its still-live values through the write path (batched
-/// under the write mutex — atomic against every writer, no OCC needed), and
-/// retire it at S = the visible seqno after the last relocation.
+/// ratio, relocate its still-live values through the write path, and
+/// retire it at S = the visible seqno after the last relocation. Each
+/// chunk's liveness probes and value reads run outside the write mutex;
+/// under it, a chunk only re-checks that each pointer is unchanged and
+/// applies, with no fsync: the one sync before the manifest flip makes the
+/// relocations durable, and any write that syncs the WAL syncs the vlog head
+/// first while it holds their appends. A writer waits at most one chunk's
+/// re-check.
 pub(crate) fn gc_vlog(db: &Arc<DbInner>) -> Result<Option<u64>> {
     let _g = db.gc_mu.lock();
+    gc_vlog_locked(db)
+}
+
+/// `gc_vlog` for a caller already holding `gc_mu`.
+pub(crate) fn gc_vlog_locked(db: &Arc<DbInner>) -> Result<Option<u64>> {
     db.check_bg_error()?;
     let started = Instant::now();
 
@@ -901,20 +938,30 @@ pub(crate) fn gc_vlog(db: &Arc<DbInner>) -> Result<Option<u64>> {
     let mut relocated_bytes: u64 = 0;
 
     for chunk in records.chunks(256) {
-        let mut ws = db.write_mu.lock();
-        let view = db.read_view();
-        let mut ops: Vec<BatchOp> = Vec::new();
+        let read = db.read_view();
+        let mut moves = Vec::new();
         for (off, len, key, _vlen) in chunk {
-            let Some((ValueKind::Put, _, repr)) = view.get_versioned(key, MAX_SEQNO)? else {
-                continue;
-            };
-            let ReprRef::Ptr(p) = decode_repr(&repr)? else {
-                continue;
-            };
-            if p.file != victim_id || p.offset != *off || p.len != *len {
+            let Some(p) = live_pointer(&read, key, victim_id, *off, *len)? else {
                 continue; // relocated or overwritten already — garbage now
+            };
+            #[cfg(test)]
+            if let Some(hook) = db.relocation_read.lock().clone() {
+                hook();
             }
             let value = vlog::read_value(&handle, &p, key, None)?;
+            moves.push((key, p, value));
+        }
+        if moves.is_empty() {
+            continue;
+        }
+        let mut ws = db.write_mu.lock();
+        let view = db.read_view();
+        let mut ops: Vec<BatchOp> = Vec::with_capacity(moves.len());
+        for (key, p, value) in moves {
+            let unchanged = live_pointer(&view, key, victim_id, p.offset, p.len)?.is_some();
+            if !unchanged {
+                continue; // a write replaced it while the value was read
+            }
             relocated += 1;
             relocated_bytes += value.len() as u64;
             ops.push(BatchOp::Put {
@@ -924,7 +971,7 @@ pub(crate) fn gc_vlog(db: &Arc<DbInner>) -> Result<Option<u64>> {
         }
         if !ops.is_empty() {
             // relocations change placement, not logical state: never capture
-            db.apply_locked(&mut ws, &ops, false)?;
+            db.apply_locked(&mut ws, &ops, false, Placed::Relocated)?;
         }
     }
 
@@ -972,6 +1019,195 @@ pub(crate) fn gc_vlog(db: &Arc<DbInner>) -> Result<Option<u64>> {
         "value-log gc: live records relocated, file retired"
     );
     Ok(Some(victim_id))
+}
+
+#[cfg(test)]
+mod relocation_tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+
+    use super::*;
+    use crate::config::{Options, SyncMode};
+
+    fn opts() -> Options {
+        Options {
+            sync: SyncMode::Always,
+            value_threshold: 1024,
+            vlog_file_size: GC_SAMPLE_MIN_FILE,
+            ..Options::default()
+        }
+    }
+
+    fn key(i: usize) -> String {
+        format!("key/{i:06}")
+    }
+
+    fn written(db: &crate::Db, keys: std::ops::Range<usize>, value: &[u8]) {
+        let all: Vec<usize> = keys.collect();
+        for part in all.chunks(256) {
+            let mut batch = crate::WriteBatch::new();
+            for &i in part {
+                batch.put(key(i), value.to_vec());
+            }
+            db.write(batch).unwrap();
+        }
+    }
+
+    // fills two vlog files, then overwrites the oldest quarter of the keys:
+    // the first file's head is dead and the rest of it is live, so its
+    // relocation moves many chunks
+    fn garbage(db: &crate::Db) -> (usize, usize) {
+        let value = vec![7u8; 1500];
+        let keys = 2 * GC_SAMPLE_MIN_FILE as usize / value.len();
+        written(db, 0..keys, &value);
+        let dead = keys / 4;
+        written(db, 0..dead, &[9u8; 1500]);
+        (keys, dead)
+    }
+
+    #[test]
+    fn a_relocation_of_many_chunks_syncs_the_wal_for_none_of_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::Db::open(dir.path(), opts()).unwrap();
+        let inner = db.inner.clone();
+        let _gc = inner.gc_mu.lock();
+        let (keys, dead) = garbage(&db);
+        let syncs = inner.wal_syncs.load(Ordering::Acquire);
+        let relocated_before = inner.relocated_seqnos.load(Ordering::Acquire);
+        let victim = gc_vlog_locked(&inner).unwrap();
+        assert!(victim.is_some());
+        let relocated = inner.relocated_seqnos.load(Ordering::Acquire) - relocated_before;
+        assert!(relocated > 256, "{relocated} relocations fit one chunk");
+        assert_eq!(inner.wal_syncs.load(Ordering::Acquire), syncs);
+        for i in 0..keys {
+            let expected = if i < dead { 9u8 } else { 7u8 };
+            assert_eq!(
+                db.get(key(i).as_bytes()).unwrap(),
+                Some(vec![expected; 1500])
+            );
+        }
+    }
+
+    #[test]
+    fn relocations_do_not_rearm_the_sample_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::Db::open(dir.path(), opts()).unwrap();
+        let inner = db.inner.clone();
+        let _gc = inner.gc_mu.lock();
+        garbage(&db);
+        let before = written_marks(&inner);
+        gc_vlog_locked(&inner).unwrap().unwrap();
+        assert_eq!(written_marks(&inner), before);
+    }
+
+    #[test]
+    fn a_write_lands_while_a_relocation_reads_its_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::Db::open(dir.path(), opts()).unwrap());
+        let inner = db.inner.clone();
+        let (reading, read) = mpsc::channel::<()>();
+        let (release, released) = mpsc::channel::<()>();
+        let released = parking_lot::Mutex::new(released);
+        let fired = AtomicBool::new(false);
+        let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let first = !fired.swap(true, Ordering::AcqRel);
+            if first {
+                reading.send(()).unwrap();
+                released.lock().recv().unwrap();
+            }
+        });
+        *inner.relocation_read.lock() = Some(hook);
+        {
+            let _gc = inner.gc_mu.lock();
+            garbage(&db);
+        }
+        let collector = std::thread::spawn({
+            let inner = inner.clone();
+            move || gc_vlog(&inner)
+        });
+        read.recv().unwrap();
+        db.put("written/while-relocating", "landed").unwrap();
+        assert_eq!(
+            db.get(b"written/while-relocating").unwrap(),
+            Some(b"landed".to_vec())
+        );
+        release.send(()).unwrap();
+        collector.join().unwrap().unwrap();
+    }
+
+    // a power cut now: every file as the OS holds it, except the vlog head,
+    // which keeps only what its last fdatasync made durable
+    fn crash_image(inner: &DbInner, to: &std::path::Path) {
+        let (head, _, synced) = inner.vlog.head_state();
+        for entry in std::fs::read_dir(&inner.paths.dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+            }
+        }
+        let name = inner.paths.vlog(head);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(to.join(name.file_name().unwrap()))
+            .unwrap()
+            .set_len(synced)
+            .unwrap();
+    }
+
+    #[test]
+    fn an_inline_write_after_a_relocated_chunk_makes_the_chunk_durable_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::Db::open(dir.path(), opts()).unwrap());
+        let inner = db.inner.clone();
+        let (reading, read) = mpsc::channel::<()>();
+        let (release, released) = mpsc::channel::<()>();
+        let released = parking_lot::Mutex::new(released);
+        let fired = AtomicBool::new(false);
+        let watched = Arc::downgrade(&inner);
+        let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let applied = watched
+                .upgrade()
+                .is_some_and(|inner| inner.relocated_seqnos.load(Ordering::Acquire) > 0);
+            if applied && !fired.swap(true, Ordering::AcqRel) {
+                reading.send(()).unwrap();
+                released.lock().recv().unwrap();
+            }
+        });
+        *inner.relocation_read.lock() = Some(hook);
+        let (keys, dead) = {
+            let _gc = inner.gc_mu.lock();
+            garbage(&db)
+        };
+        let collector = std::thread::spawn({
+            let inner = inner.clone();
+            move || gc_vlog(&inner)
+        });
+        read.recv().unwrap();
+        let (_, written, synced) = inner.vlog.head_state();
+        assert!(
+            written > synced,
+            "a relocated chunk left the vlog head synced"
+        );
+        db.put("written/after-relocation", "inline").unwrap();
+        crash_image(&inner, image.path());
+        release.send(()).unwrap();
+        collector.join().unwrap().unwrap();
+        drop(inner);
+        drop(db);
+        let db = crate::Db::open(image.path(), opts()).unwrap();
+        assert_eq!(
+            db.get(b"written/after-relocation").unwrap(),
+            Some(b"inline".to_vec())
+        );
+        for i in 0..keys {
+            let expected = if i < dead { 9u8 } else { 7u8 };
+            assert_eq!(
+                db.get(key(i).as_bytes()).unwrap(),
+                Some(vec![expected; 1500])
+            );
+        }
+    }
 }
 
 #[cfg(test)]

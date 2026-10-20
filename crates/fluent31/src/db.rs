@@ -251,6 +251,16 @@ impl Drop for DirLock {
     }
 }
 
+/// What an `apply_locked` batch is: a write, which is durable before it is
+/// acknowledged, or a GC relocation, which changes placement only and is
+/// made durable before the manifest flip that retires its victim, or sooner
+/// by the next write that syncs the WAL, which syncs the vlog head first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Placed {
+    Written,
+    Relocated,
+}
+
 pub(crate) struct DbInner {
     pub opts: Options,
     pub paths: DbPaths,
@@ -283,11 +293,22 @@ pub(crate) struct DbInner {
     pub retired: Mutex<Vec<RetiredVlog>>,
     /// Serializes vlog GC passes (manual + automatic).
     pub gc_mu: Mutex<()>,
-    /// GC sampling cooldowns: vlog file id -> (visible seqno, vlog head id)
-    /// at last sample. A below-ratio file is resampled once enough new
-    /// writes happened — by seqno count, OR by the head having rotated
-    /// (large-value workloads accrue garbage fast while seqnos crawl).
+    /// GC sampling cooldowns: vlog file id -> (seqnos written, head
+    /// rotations written) at last sample. A below-ratio file is resampled
+    /// once enough new writes happened — by seqno count, OR by a write
+    /// having rotated the head (large-value workloads accrue garbage fast
+    /// while seqnos crawl). GC's own relocations count toward neither:
+    /// they make no garbage in other files, and counting them re-armed
+    /// every file after each pass.
     pub gc_sampled_at: Mutex<std::collections::HashMap<u64, (SeqNo, u64)>>,
+    /// Vlog head rotations caused by writes, not by GC relocations.
+    pub written_rotations: AtomicU64,
+    /// Seqnos taken by GC relocations, so writes' own progress is
+    /// `visible_seqno - relocated_seqnos`.
+    pub relocated_seqnos: AtomicU64,
+    /// Runs before a GC relocation reads a live value.
+    #[cfg(test)]
+    pub relocation_read: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Serializes the compaction scheduler: background maintenance and
     /// user-invoked `compact_all` share one priority picker. Rewrite jobs may
     /// be suspended between bounded slices, but never run concurrently.
@@ -603,7 +624,7 @@ impl DbInner {
         // the direct path.
         if self.opts.sync != SyncMode::Always {
             let mut ws = self.write_mu.lock();
-            let r = self.apply_locked(&mut ws, &batch.ops, capture);
+            let r = self.apply_locked(&mut ws, &batch.ops, capture, Placed::Written);
             self.commit_groups.fetch_add(1, Ordering::Relaxed);
             self.commit_batches.fetch_add(1, Ordering::Relaxed);
             return r;
@@ -700,7 +721,9 @@ impl DbInner {
         ws: &mut WriteState,
         ops: &[BatchOp],
         capture: bool,
+        placed: Placed,
     ) -> Result<()> {
+        let syncs = placed == Placed::Written && self.opts.sync == SyncMode::Always;
         let base = self.visible_seqno.load(Ordering::Acquire) + 1;
         // trigger events ride the same batch (atomic through WAL, memtable,
         // and crash recovery). Materialized HERE, after the base seqno is
@@ -729,12 +752,10 @@ impl DbInner {
 
         // 1. place large values in the vlog
         let mut entries = Vec::with_capacity(total);
-        let mut any_vlog = false;
         for op in ops.iter().chain(events.iter()) {
             let e = match op {
                 BatchOp::Put { key, value } => {
                     let repr = if value.len() >= self.opts.value_threshold {
-                        any_vlog = true;
                         match self.vlog.append(key, value) {
                             Ok(ptr) => encode_ptr(ptr),
                             Err(e) => {
@@ -760,8 +781,11 @@ impl DbInner {
             entries.push(e);
         }
 
-        // 2. durability ordering: payload before pointer
-        if any_vlog && self.opts.sync == SyncMode::Always {
+        // 2. durability ordering: payload before pointer. The head may hold
+        // a GC relocation's unsynced appends even when this batch placed no
+        // value, so a syncing write syncs it whenever it is dirty
+        // (sync_head is a no-op on a clean head).
+        if syncs {
             if let Err(e) = self.vlog.sync_head() {
                 self.set_bg_error(format!("vlog sync failed: {e}"));
                 return Err(e);
@@ -777,7 +801,7 @@ impl DbInner {
             self.set_bg_error(format!("wal append failed: {e}"));
             return Err(e);
         }
-        if self.opts.sync == SyncMode::Always {
+        if syncs {
             if let Err(e) = ws.wal.sync() {
                 self.set_bg_error(format!("wal sync failed: {e}"));
                 return Err(e);
@@ -792,6 +816,10 @@ impl DbInner {
         }
         self.visible_seqno
             .store(base + entries.len() as u64 - 1, Ordering::Release);
+        if placed == Placed::Relocated {
+            self.relocated_seqnos
+                .fetch_add(entries.len() as u64, Ordering::Relaxed);
+        }
         self.publish_stream(base, &entries);
 
         // 4. rotations. The write is durable and published: the ack stands
@@ -804,6 +832,9 @@ impl DbInner {
             let (_, head_written, _) = self.vlog.head_state();
             if head_written >= self.opts.vlog_file_size {
                 self.rotate_vlog_locked()?;
+                if placed == Placed::Written {
+                    self.written_rotations.fetch_add(1, Ordering::Relaxed);
+                }
             }
             Ok(())
         };
@@ -927,7 +958,6 @@ impl DbInner {
 
         // ---- phase 1: place large values in the vlog --------------------
         let mut placed: Vec<(usize, u64, Vec<EncEntry>)> = Vec::with_capacity(accepted.len());
-        let mut any_vlog = false;
         'place: for (gi, (i, base, events)) in accepted.iter().enumerate() {
             let (i, base) = (*i, *base);
             let mut entries = Vec::with_capacity(batches[i].0.len() + events.len());
@@ -935,7 +965,6 @@ impl DbInner {
                 let e = match op {
                     BatchOp::Put { key, value } => {
                         let repr = if value.len() >= self.opts.value_threshold {
-                            any_vlog = true;
                             match self.vlog.append(key, value) {
                                 Ok(ptr) => encode_ptr(ptr),
                                 Err(e) => {
@@ -971,8 +1000,10 @@ impl DbInner {
 
         // ---- phase 2: durability ordering — payload before pointer ------
         // (vlog fsync before any WAL record referencing it becomes durable;
-        // ONE sync for the whole group)
-        if any_vlog && self.opts.sync == SyncMode::Always {
+        // ONE sync for the whole group). The head may hold a GC relocation's
+        // unsynced appends even when this group placed no value, so it syncs
+        // whenever it is dirty (sync_head is a no-op on a clean head).
+        if self.opts.sync == SyncMode::Always && !placed.is_empty() {
             if let Err(e) = self.vlog.sync_head() {
                 let msg = e.to_string();
                 self.set_bg_error(format!("vlog sync failed: {msg}"));
@@ -1071,6 +1102,7 @@ impl DbInner {
                     let (_, head_written, _) = self.vlog.head_state();
                     if head_written >= self.opts.vlog_file_size {
                         self.rotate_vlog_locked()?;
+                        self.written_rotations.fetch_add(1, Ordering::Relaxed);
                     }
                     Ok(())
                 };
@@ -2482,6 +2514,10 @@ fn open_inner_with(
         retired: Mutex::new(retired_list),
         gc_mu: Mutex::new(()),
         gc_sampled_at: Mutex::new(std::collections::HashMap::new()),
+        written_rotations: AtomicU64::new(0),
+        relocated_seqnos: AtomicU64::new(0),
+        #[cfg(test)]
+        relocation_read: Mutex::new(None),
         compaction_mu: Mutex::new(()),
         subs: Mutex::new(Vec::new()),
         subs_active: AtomicBool::new(false),

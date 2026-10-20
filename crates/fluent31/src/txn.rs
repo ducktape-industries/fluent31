@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::batch::BatchOp;
 use crate::config::SyncMode;
-use crate::db::DbInner;
+use crate::db::{DbInner, Placed};
 use crate::error::{Error, Result};
 use crate::iter::DbIterator;
 use crate::types::{validate_user_key, SeqNo};
@@ -216,7 +216,8 @@ impl Txn {
             if conflicted {
                 Err(Error::Conflict)
             } else if !ops.is_empty() {
-                self.db.apply_locked(&mut ws, &ops, capture)
+                self.db
+                    .apply_locked(&mut ws, &ops, capture, Placed::Written)
             } else {
                 Ok(())
             }
